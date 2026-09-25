@@ -163,6 +163,7 @@ follow-ups.md
 *.db
 *.db-wal
 *.db-shm
+.career-ops-data
 
 # OpenRouter runner — generated data (personal, never commit)
 data/model-blacklist.json
