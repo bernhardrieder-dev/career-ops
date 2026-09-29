@@ -199,17 +199,19 @@ function facetCoverage(facet) {
 /**
  * Board size according to the facets, or null when no facet carries counts.
  *
- * Each facet partitions the same board, so any one of them should sum to the
- * true total; they disagree slightly in practice (a posting missing a facet
- * value is absent from that facet's counts), so take the largest — the reading
- * that under-reports least. Compared against the response's own `total` by the
- * caller: facets materially higher means `total` is clamped.
+ * Non-location facets partition the board. Location facets may count one
+ * multi-location requisition in several countries, so their sum is not a
+ * board size (IQVIA: 2,634 country counts for 1,895 postings). The remaining
+ * facets can under-report slightly when a posting lacks a value; take their
+ * largest sum to detect a clamped `total` without false positives.
  *
  * Exported for the test suite, which pins the DSG numbers.
  */
 export function trueTotalFromFacets(facets) {
   let best = null;
   for (const facet of Array.isArray(facets) ? facets : []) {
+    const identity = String(facet?.descriptor || facet?.facetParameter || '').toLowerCase();
+    if (/location|country|region|state|province|city|geography|geo/.test(identity)) continue;
     const coverage = facetCoverage(facet);
     if (coverage === null) continue;
     if (best === null || coverage > best) best = coverage;

@@ -127,6 +127,21 @@ try {
     fail(`trueTotalFromFacets(DSG) returned ${dsgTrue}, expected 8425`);
   }
 
+  // IQVIA (2026-09-28): a role may appear in several countries. Its country
+  // counts exceed the honest 1,895 total, while job type and time type agree.
+  // Treating that sum as board size triggers a false 2,000-offset clamp and
+  // wastes 72 facet slices on an already-complete board.
+  const multiCountryTrue = trueTotalFromFacets([
+    { facetParameter: 'Location_Country', descriptor: 'Location Country', values: [{ count: 1300 }, { count: 1334 }] },
+    { facetParameter: 'workerSubType', descriptor: 'Job Type', values: [{ count: 1895 }] },
+    { facetParameter: 'timeType', descriptor: 'Time Type', values: [{ count: 1714 }, { count: 181 }] },
+  ]);
+  if (multiCountryTrue === 1895) {
+    pass('trueTotalFromFacets() excludes overlapping country counts from board size');
+  } else {
+    fail(`trueTotalFromFacets(multi-country) returned ${multiCountryTrue}, expected 1895`);
+  }
+
   if (trueTotalFromFacets([]) === null && trueTotalFromFacets(undefined) === null) {
     pass('trueTotalFromFacets() returns null when there are no facets to read');
   } else {
