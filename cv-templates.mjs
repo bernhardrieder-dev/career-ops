@@ -220,14 +220,20 @@ export function validateTemplate(path, kind) {
   return { ok: missing.length === 0, missing };
 }
 
-export function loadProfileDefault(kind, { profilePath = DEFAULT_PROFILE_PATH } = {}) {
+export function loadProfileDefault(kind, { profilePath = DEFAULT_PROFILE_PATH, strict = false } = {}) {
   const cfg = KINDS[kind];
   if (!cfg) throw new Error(`Unknown template kind: ${kind}`);
   if (!existsSync(profilePath)) return null;
   let doc;
   try {
     doc = yaml.load(readFileSync(profilePath, 'utf-8')) || {};
-  } catch {
+  } catch (err) {
+    if (strict) {
+      throw new Error(
+        `Failed to parse profile YAML at ${profilePath}. Fix the YAML syntax and retry the update. ${err?.message || err}`,
+        { cause: err },
+      );
+    }
     return null;
   }
   let node = doc;

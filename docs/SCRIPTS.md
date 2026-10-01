@@ -24,6 +24,7 @@ All scripts live in the project root as `.mjs` modules. Most are exposed via
 | `npm run update:check` | `update-system.mjs check` | Check for a newer published release |
 | `npm run update` | `update-system.mjs apply --confirm` | Apply upstream update |
 | `npm run rollback` | `update-system.mjs rollback` | Rollback last update |
+| `node update-system.mjs status` | `update-system.mjs status` | Print installed version + short SHA |
 | `npm run liveness` | `check-liveness.mjs` | Test if job URLs are still active |
 | `npm run extract` | `browser-extract.mjs` | Headless read-only page extractor (opt-in `scan.extractor: cli`) — compact JSON for scan/JD; Greenhouse, Lever, Ashby and Workday postings are read from their public JSON endpoints instead of the client-rendered page, and an empty jd extraction exits 1 with `code: empty_text` |
 | `node fetch-jd.mjs <url>` | `fetch-jd.mjs` | JD text on stdout from a known ATS API (Greenhouse/Lever/Ashby/Workday) — exit 1 with empty stdout when the host has no JD-bearing API, so a caller falls back to its browser/WebFetch path |
@@ -468,6 +469,23 @@ Contact line format (TSV, one per line, `#`-prefixed lines are comments):
 
 **Exit codes:** `0` always (an empty/missing store prints an explanatory message and writes no file), `1` self-test failure or a `--vcf` path escaping the project directory.
 
+## contact-extract
+
+Extract a recruiter or interviewer from a pasted reply, attach the contact to a
+matching tracker row, and create or update the corresponding name+company row
+in `data/contacts.tsv`. The script is local-only: it never sends a message and
+never changes application status. Without `--yes`, it asks before writing.
+
+```bash
+node contact-extract.mjs --file email.txt
+node contact-extract.mjs --file email.txt --company "Acme Inc" --tracker 42
+```
+
+The input format is `Subject:`, `From:`, a blank line, then the message body.
+Use `--type recruiter|hiring-manager|peer|interviewer|other` to override the
+inferred type. `--company` and `--tracker` are validated against the same
+tracker row, so a contact cannot be attached across companies.
+
 ---
 
 ## weekly-digest
@@ -571,6 +589,32 @@ Possible JSON responses:
 
 `check --force` ignores a dismissal. `check --channel main` keeps the previous behaviour for installs that follow `main`: main's `VERSION` plus system-file drift (`reason: system-files-changed`).
 
+The `local` field in the JSON output stays a bare semver string (e.g., `"1.32.0"`). A separate `local_sha` field is provided alongside it when the install is a git checkout — containing the short commit SHA (e.g., `"ae919b6f"`). For tarball installs without git metadata, `local_sha` will be omitted. This lets a bug report identify the exact tree under test, not just the release name (two installs pulled days apart can share a version string while running different code — see #3203).
+
+**Exit codes:** `0` always.
+
+---
+
+## status
+
+Prints the installed version to stdout — a quick human-readable alternative to parsing `check` JSON.
+
+```bash
+node update-system.mjs status
+```
+
+Example output:
+
+```
+career-ops v1.32.0 (ae919b6f)
+```
+
+On a tarball install with no git metadata the short SHA is omitted:
+
+```
+career-ops v1.32.0
+```
+
 **Exit codes:** `0` always.
 
 ---
@@ -636,11 +680,13 @@ For custom SSR pages, configure a tracked company with `scan_method: local_parse
 ```yaml
 parser:
   command: node
-  script: scripts/parsers/example-company-jobs.js
+  script: local/example-company-jobs.js
   format: jobs-json-v1
 ```
 
 Use `args` only for reusable parsers that intentionally accept runtime parameters such as `{careers_url}` or `{company}`.
+
+The script must resolve inside the repo root (security boundary in `providers/local-parser.mjs`). Keep a private, non-contributed parser under a gitignored path — `local/` is ignored by default — so it is never staged; `portals.yml` itself is already gitignored. Use `scripts/parsers/` only for a parser you intend to upstream. See [local-parser-cookbook.md](local-parser-cookbook.md).
 
 If a parser writes full extraction artifacts for debugging or audit, store them under `data/parser-output/{company}/`. `scan.mjs` reads stdout and does not require those JSON files after parsing. Keep generated JSON artifacts out of git; `.gitkeep` placeholders are the only exception for preserving directory structure.
 
@@ -681,6 +727,14 @@ Defaults are unchanged, so a single-lane setup needs none of this. Note that the
 
 Reverse ATS discovery scanner. Where `scan.mjs` scans the companies you track in `portals.yml`, this inverts the direction: it walks public directories of companies per ATS (Greenhouse, Lever, Ashby, Workday, iCIMS, BambooHR) and surfaces fresh postings matching your `portals.yml` `title_filter` / `location_filter` — no manual company curation. Company directories come from the public [job-board-aggregator](https://github.com/Feashliaa/job-board-aggregator) dataset, cached in `data/cache/` for 24 hours.
 
+Pass `--history-seeds` to derive board seeds locally from posting URLs already
+in the user's tracker and `data/scan-history.tsv`. A normal run does not read
+either history source. With the flag, known ATS hosts route to the
+matching installed provider; an unknown host remains its hostname rather than
+being discarded. Known vendor labels become scannable automatically if a
+matching provider is added later. This is read-only input: no tracker column or
+apply-time browser capture is required, and history is never uploaded or pooled.
+
 BambooHR's and iCIMS's list pages both carry no publish date, so every match from either is undated on first pass; the scanner enriches it from the job's detail endpoint (one extra request per match that already cleared the title/location filters), then applies `--since` as usual.
 
 Postings without a usable publish date are dropped by default — a reverse scan targets fresh postings, and an undated flood would defeat that — but `--include-undated` keeps them (each marked `dateStatus: "unknown"` in `--json` output; the human log shows `n/a` for the date). New matches are appended to `data/pipeline.md` and `data/scan-history.tsv` in the same format as `scan.mjs`.
@@ -707,6 +761,8 @@ Same detection logic applies to `scan.mjs` (the standard portal scanner) — the
 npm run scan:full                              # all ATS directories, last 3 days
 node scan-ats-full.mjs --since 7               # postings from the last 7 days
 node scan-ats-full.mjs --ats greenhouse,workday # subset of sources
+node scan-ats-full.mjs --history-seeds          # also scan boards found in local history
+node scan-ats-full.mjs --history-seeds --ats successfactors # history-derived SF boards only
 node scan-ats-full.mjs --limit 200             # max companies per ATS
 node scan-ats-full.mjs --dry-run               # preview without writing
 node scan-ats-full.mjs --liveness              # Playwright-verify matches first
