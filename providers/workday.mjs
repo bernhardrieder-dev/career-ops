@@ -641,7 +641,17 @@ export function isMultiLocationPlaceholder(location) {
 // asked for. The cap bounds that; it is deliberately loud rather than silent
 // (see the console.error below), because a silent cap reads as "all locations
 // resolved" when it isn't.
+// Override per entry with `max_detail_requests` (ceiling below) for a tenant
+// whose placeholders the default leaves unresolved — the cap line names the count.
 const MAX_DETAIL_REQUESTS = 200;
+const MAX_DETAIL_REQUESTS_CAP = 2000;
+
+/** Resolve the detail-request cap: a positive integer `max_detail_requests` on the entry, capped. */
+function resolveMaxDetailRequests(entry) {
+  const v = entry?.max_detail_requests;
+  if (Number.isInteger(v) && v > 0) return Math.min(v, MAX_DETAIL_REQUESTS_CAP);
+  return MAX_DETAIL_REQUESTS;
+}
 
 /**
  * The real places behind a multi-location placeholder, from the detail document.
@@ -1137,6 +1147,7 @@ export default {
       // request cap's name: with RETRY_POLICY at 3 retries, a tenant answering
       // 503 turned a promised 200 GETs into 800 (measured, not reasoned) —
       // and a failing tenant is exactly where restraint matters most.
+      const maxDetailRequests = resolveMaxDetailRequests(entry);
       let requests = 0;
       let attempted = 0;
       // Meters the transport itself rather than trusting a post-hoc count:
@@ -1148,7 +1159,7 @@ export default {
       const meteredCtx = Object.create(ctx);
       meteredCtx.fetchJson = (url, opts) => { requests++; return ctx.fetchJson(url, opts); };
       for (const job of pending) {
-        if (requests >= MAX_DETAIL_REQUESTS) break;
+        if (requests >= maxDetailRequests) break;
         const externalPath = job.url.slice(ep.jobBase.length);
         attempted++;
         // Same politeness as the pagination loop: one tenant, one request at a
@@ -1158,7 +1169,7 @@ export default {
         // getting more requests: `remaining` is at least 1 (the loop broke
         // otherwise), so this posting spends at most what is left and the
         // documented ceiling holds for every tenant, not just healthy ones.
-        const remaining = MAX_DETAIL_REQUESTS - requests;
+        const remaining = maxDetailRequests - requests;
         const policy = { ...RETRY_POLICY, retries: Math.min(RETRY_POLICY.retries, remaining - 1) };
         // Fetched once and parsed twice: the location and the date both live in
         // this one document, and a second GET for the date would double the
@@ -1190,7 +1201,7 @@ export default {
         }
       }
       if (placeholders.length > 0) {
-        const capped = pending.length > attempted ? `, ${pending.length - attempted} left unresolved by the ${MAX_DETAIL_REQUESTS}-request cap` : '';
+        const capped = pending.length > attempted ? `, ${pending.length - attempted} left unresolved by the ${maxDetailRequests}-request cap` : '';
         const unreadable = failed > 0 ? `, ${failed} detail document(s) unreadable` : '';
         const unroutable = unaddressable > 0 ? `, ${unaddressable} with no site-relative path` : '';
         // Reported separately from `resolved` because the two can differ: a

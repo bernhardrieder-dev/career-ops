@@ -361,6 +361,29 @@ for (const [label, detailImpl] of [
   }
 }
 
+// `max_detail_requests` on the entry raises the cap for a tenant whose
+// placeholders the default leaves behind (IQVIA had 687 in one run).
+{
+  const many = Array.from({ length: 260 }, (_, i) => ({
+    title: `Engineer ${i}`,
+    externalPath: `/job/USA---Sunnyvale-CA/Engineer-${i}_R${i}`,
+    locationsText: '3 Locations',
+    postedOn: 'Posted Today',
+  }));
+  let detailRequests = 0;
+  const { result: jobs } = await captureConsoleErrors(() => workday.fetch({ ...ENTRY, max_detail_requests: 300 }, mkCtx(async (url, opts) => {
+    if (url.endsWith('/jobs')) {
+      const offset = JSON.parse(opts?.body || '{}').offset || 0;
+      return { total: many.length, jobPostings: many.slice(offset, offset + 20) };
+    }
+    detailRequests++;
+    return DETAIL;
+  })));
+  const resolvedCount = jobs.filter((j) => j.location !== '3 Locations').length;
+  if (detailRequests === 260 && resolvedCount === 260) pass('max_detail_requests on the entry raises the detail cap');
+  else fail(`with max_detail_requests: 300, made ${detailRequests} requests and resolved ${resolvedCount}, expected 260/260`);
+}
+
 // The cap must bound REQUESTS, not postings. The block above only ever walks
 // the happy path, where the two are the same number — so on its own it cannot
 // see a retry. A tenant answering 503 retries RETRY_POLICY.retries times per
