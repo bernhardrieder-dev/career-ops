@@ -30,6 +30,9 @@ import { safeEncodeURIComponent } from './_safe-url.mjs';
 //                               #   'title'  — regex on the job title only (cheap; misses body-level remote)
 //                               #   'off'    — skip the remote pass entirely
 //       remoteMaxPages: 10      # 'filter' mode: max pages to paginate (size each); default 1
+//       domesticCountry: Deutschland  # optional; appended to German locations ("Bochum, Deutschland")
+//                               # so a country-level location_filter.allow matches them. Default
+//                               # off: a commute-radius filter keyed on city names wants the bare city.
 //     enabled: true
 
 // v6. The v4 search and detail endpoints both 404 as of 2026-08-04 (#2494);
@@ -52,7 +55,7 @@ function intInRange(val, def, min, max) {
 /**
  * Reads and sanitizes the entry's `arbeitsagentur:` config block.
  * @param {{ arbeitsagentur?: any }} entry
- * @returns {{ keywords: string[], wo: string, umkreis: number, days: number, size: number, remoteNationwide: boolean, remoteMatch: 'title'|'filter'|'off', remoteMaxPages: number }}
+ * @returns {{ keywords: string[], wo: string, umkreis: number, days: number, size: number, remoteNationwide: boolean, remoteMatch: 'title'|'filter'|'off', remoteMaxPages: number, domesticCountry: string }}
  */
 export function parseArbeitsagenturConfig(entry) {
   const cfg = (entry && entry.arbeitsagentur) || {};
@@ -69,6 +72,7 @@ export function parseArbeitsagenturConfig(entry) {
     // Remote-detection mode is config-driven (not hardcoded).
     remoteMatch: ['title', 'filter', 'off'].includes(cfg.remoteMatch) ? cfg.remoteMatch : 'title',
     remoteMaxPages: intInRange(cfg.remoteMaxPages, 1, 1, 20),
+    domesticCountry: typeof cfg.domesticCountry === 'string' ? cfg.domesticCountry.trim() : '',
   };
 }
 
@@ -84,15 +88,16 @@ export function parseArbeitsagenturConfig(entry) {
  * city stands alone. A posting may list several locations; the downstream shape
  * is one string, so the first is used, as v4's single field effectively was.
  * @param {any} lokationen
+ * @param {string} [domesticCountry] appended to a German location when set (opt-in)
  */
-export function buildLocation(lokationen) {
+export function buildLocation(lokationen, domesticCountry = '') {
   if (!Array.isArray(lokationen)) return '';
   const adresse = lokationen[0] && lokationen[0].adresse;
   if (!adresse || typeof adresse !== 'object') return '';
   const loc = String(adresse.ort || '').trim();
   const land = adresse.land;
   if (land && !/deutschland|germany/i.test(land)) return loc ? `${loc}, ${land}` : String(land);
-  return loc;
+  return loc && domesticCountry ? `${loc}, ${domesticCountry}` : loc;
 }
 
 /**
@@ -105,9 +110,10 @@ export function buildLocation(lokationen) {
  * `stellenlokationen[]` (#2494). The public job-detail page still resolves by
  * reference number, so the outgoing URL is unchanged.
  * @param {any} job
+ * @param {string} [domesticCountry] see buildLocation
  * @returns {({title: string, url: string, company: string, location: string, refnr: string}) | null}
  */
-export function normalizeJob(job) {
+export function normalizeJob(job, domesticCountry = '') {
   const refnr = job && job.referenznummer;
   const title = String((job && job.stellenangebotsTitel) || '').trim();
   if (!refnr || !title) return null;
@@ -120,7 +126,7 @@ export function normalizeJob(job) {
     title,
     url: DETAIL_BASE + encodedRefnr,
     company: String((job && job.firma) || '').trim(),
-    location: buildLocation(job && job.stellenlokationen),
+    location: buildLocation(job && job.stellenlokationen, domesticCountry),
     refnr: String(refnr),
   };
 }
@@ -155,7 +161,7 @@ export default {
    * @returns {Promise<Array<{title: string, url: string, company: string, location: string}>>}
    */
   async fetch(entry, ctx) {
-    const { keywords, wo, umkreis, days, size, remoteNationwide, remoteMatch, remoteMaxPages } = parseArbeitsagenturConfig(entry);
+    const { keywords, wo, umkreis, days, size, remoteNationwide, remoteMatch, remoteMaxPages, domesticCountry } = parseArbeitsagenturConfig(entry);
     if (!keywords.length) {
       throw new Error(`arbeitsagentur: entry "${entry.name || '(unnamed)'}" has no arbeitsagentur.keywords[]`);
     }
@@ -224,7 +230,7 @@ export default {
       }
       // Pass A (commutable) keeps its city as-is.
       for (const raw of primary) {
-        const job = normalizeJob(raw);
+        const job = normalizeJob(raw, domesticCountry);
         if (job && !byRef.has(job.refnr)) byRef.set(job.refnr, job);
       }
       // Pass B roles get a `Deutschlandweit (Homeoffice)` marker, which makes
@@ -240,7 +246,7 @@ export default {
       // on two pages.
       const wideJobs = [...new Map(
         wide
-          .map(normalizeJob)
+          .map(raw => normalizeJob(raw, domesticCountry))
           .filter(Boolean)
           .filter(job => !byRef.has(job.refnr))
           .map(job => [job.refnr, job]),

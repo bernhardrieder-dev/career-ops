@@ -64,6 +64,15 @@ try {
   } else {
     fail(`buildLocation non-DE = ${JSON.stringify(buildLocation([{ adresse: { ort: 'Wien', land: 'OESTERREICH' } }]))}`);
   }
+  // Opt-in domesticCountry: a country-level allow list needs the country on German rows too.
+  if (buildLocation([{ adresse: { ort: 'Bochum', land: 'DEUTSCHLAND' } }], 'Deutschland') === 'Bochum, Deutschland'
+    && buildLocation([{ adresse: { ort: 'Wien', land: 'OESTERREICH' } }], 'Deutschland') === 'Wien, OESTERREICH'
+    && parseArbeitsagenturConfig({ arbeitsagentur: { domesticCountry: ' Deutschland ' } }).domesticCountry === 'Deutschland'
+    && parseArbeitsagenturConfig({ arbeitsagentur: {} }).domesticCountry === '') {
+    pass('buildLocation appends domesticCountry to German locations only, and only when configured');
+  } else {
+    fail(`buildLocation domesticCountry = ${JSON.stringify(buildLocation([{ adresse: { ort: 'Bochum', land: 'DEUTSCHLAND' } }], 'Deutschland'))}`);
+  }
   // 11% of a sampled page carried more than one location; the downstream shape is
   // a single string, so the first is used — matching v4's single `arbeitsort`.
   if (buildLocation([{ adresse: { ort: 'Hamburg', land: 'DEUTSCHLAND' } }, { adresse: { ort: 'Bremen' } }]) === 'Hamburg') {
