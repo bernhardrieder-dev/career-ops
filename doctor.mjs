@@ -13,8 +13,9 @@ import { fileURLToPath } from 'url';
 import * as yaml from 'js-yaml';
 import dotenv from 'dotenv';
 import { findTitleFilterConflicts } from './lib/title-filter-conflicts.mjs';
+import { sectionState, scanHeadings, SECTIONS } from './lib/personalization.mjs';
 import { discoverPlugins, pluginRoots, pluginStatus } from './plugins/_engine.mjs';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, getProfilePath, hasProfileOverride } from './path-resolver.mjs';
 import { validateProfile, EXAMPLE_PATH } from './validate-profile.mjs';
 import { resolveExtractorMode } from './browser-extract.mjs';
 import { parseConfigByExtension } from './jsonc-parse.mjs';
@@ -62,6 +63,24 @@ validateFlags(argv, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperan
 const targetIdx = argv.indexOf('--target');
 const explicitTarget = targetIdx !== -1 && argv[targetIdx + 1] ? argv[targetIdx + 1] : null;
 const projectRoot = explicitTarget || getCareerOpsRoot();
+// --target diagnoses a whole other checkout, so that checkout's profile is the
+// one that counts; otherwise CAREER_OPS_PROFILE applies as it does everywhere.
+// With no override the path is the root the doctor started from: the human run
+// loads the root's whole .env later, and a CAREER_OPS_ROOT in it must not move
+// this one check to another root.
+const profilePathFor = (root) => (explicitTarget || !hasProfileOverride() ? getProfilePath(root) : getProfilePath());
+// Only scan.mjs, the evaluators, openai-tailor.mjs and openrouter-runner load a .env; most readers
+// of the profile see the process environment alone. Doctor reports what they see,
+// so an override set only in the root's .env is looked up for the advice below
+// but never counted as a found profile.
+const profileFromEnvFile = (root) => {
+  try {
+    const value = dotenv.parse(readFileSync(join(root, '.env'))).CAREER_OPS_PROFILE;
+    return value?.trim() ? value.trim() : null;
+  } catch {
+    return null; // no .env, or unreadable
+  }
+};
 // node_modules and .git belong to the CODE checkout, not the resolved data
 // root — under a split checkout (CAREER_OPS_ROOT/CAREER_OPS_DATA_DIR or the
 // .career-ops-data marker) those are two different directories, and neither
@@ -594,7 +613,10 @@ function resolveActiveCli() {
   }
   // .env is best-effort: missing file → fall through to default. dotenv does
   // not throw on a missing path when `quiet: true`, so no try/catch is needed.
+  // The load must not make a .env-only CAREER_OPS_PROFILE look like a shell one.
+  const hadProfileOverride = hasProfileOverride();
   dotenv.config({ path: join(projectRoot, '.env'), quiet: true });
+  if (!hadProfileOverride) delete process.env.CAREER_OPS_PROFILE;
   if (process.env.CAREER_OPS_CLI) {
     if (!VALID_CLIS.includes(process.env.CAREER_OPS_CLI)) {
       return { cli: 'unknown', source: '.env', warning: `CAREER_OPS_CLI in .env is not a recognized CLI. Valid: ${VALID_CLIS.join(', ')}.` };
@@ -663,7 +685,7 @@ function checkPlaywrightMcp(root, activeCli) {
 // is selected but the helper is missing, the modes fall back to MCP — surface
 // that as a warning, never a failure.
 function checkScanExtractor(root) {
-  const mode = resolveExtractorMode(join(root, 'config', 'profile.yml'));
+  const mode = resolveExtractorMode(profilePathFor(root));
   if (mode === 'cli') {
     if (existsSync(join(__dirname, 'browser-extract.mjs'))) {
       return { pass: true, label: 'Scan extractor: cli (browser-extract.mjs)' };
@@ -705,6 +727,7 @@ const USER_LAYER_PREREQS = [
   },
   {
     path: 'portals.yml',
+    env: 'CAREER_OPS_PORTALS',
     fix: [
       'Run: cp templates/portals.example.yml portals.yml',
       'Then customize with your target companies',
@@ -712,13 +735,58 @@ const USER_LAYER_PREREQS = [
   },
 ];
 
-function prereqPresent(root, path) {
-  return existsSync(join(root, ...path.split('/')));
+const CLI_NAMES = 'claude, codex, gemini, opencode, qwen, agy or grok';
+
+// The lane variables (CAREER_OPS_PORTALS, CAREER_OPS_PIPELINE) move one file
+// out of the data root, and the scanner reads them (path-resolver.mjs), so
+// doctor has to look where a scan would.
+const PORTALS_PREREQ = USER_LAYER_PREREQS.find(({ path }) => path === 'portals.yml');
+
+function prereqFile(root, { path, env }) {
+  if (path === 'config/profile.yml') return profilePathFor(root);
+  return (env && process.env[env]) || join(root, ...path.split('/'));
 }
 
-function checkPrereq({ path, fix }) {
-  if (prereqPresent(projectRoot, path)) {
+function prereqPresent(root, prereq) {
+  return existsSync(prereqFile(root, prereq));
+}
+
+// The root's .env names a profile. scan.mjs, the evaluators, openai-tailor.mjs and
+// openrouter-runner.mjs load a .env, and all four follow CAREER_OPS_PROFILE once
+// it is loaded (scan.mjs from the data root, the evaluators and openai-tailor.mjs
+// from a working-directory config(), openrouter-runner.mjs from the code root).
+// The other readers load none. That is a split whether or not a data-root profile exists, so it is
+// reported either way. A shell value shadows the .env, so it is not a split then.
+function checkEnvFileProfile(root) {
+  const fromEnvFile = explicitTarget || hasProfileOverride() ? null : profileFromEnvFile(root);
+  if (!fromEnvFile) return null;
+  return {
+    warn: true,
+    label: `.env sets CAREER_OPS_PROFILE=${fromEnvFile}, but of the profile readers, only scan.mjs, the evaluators, openai-tailor.mjs and openrouter-runner.mjs load .env; cv-sync-check, generate-pdf, upskill and the other readers use ${profilePathFor(root)}`,
+    fix: [`Export CAREER_OPS_PROFILE=${fromEnvFile} in your shell so every command reads the same file, or remove it from .env`],
+  };
+}
+
+function checkPrereq(prereq) {
+  const { path, fix } = prereq;
+  if (prereqPresent(projectRoot, prereq)) {
     return { pass: true, label: `${path} found` };
+  }
+  if (path === 'config/profile.yml' && !explicitTarget && hasProfileOverride()) {
+    const named = profilePathFor(projectRoot);
+    return {
+      warn: true,
+      label: `${path} not found (CAREER_OPS_PROFILE names ${named})`,
+      fix: [`Create ${named}, or unset CAREER_OPS_PROFILE to use the profile in the data root`],
+    };
+  }
+  const fromEnvFile = path === 'config/profile.yml' && !explicitTarget ? profileFromEnvFile(projectRoot) : null;
+  if (fromEnvFile) {
+    return {
+      warn: true,
+      label: `${path} not found (.env sets CAREER_OPS_PROFILE=${fromEnvFile}, but most commands never load .env)`,
+      fix: [`Export CAREER_OPS_PROFILE=${fromEnvFile} in your shell so every command sees it, or remove it from .env and put the profile at ${profilePathFor(projectRoot)}`],
+    };
   }
   return { warn: true, label: `${path} not found (user setup required)`, fix };
 }
@@ -774,7 +842,7 @@ function checkAutoDir(name) {
 // verify-portals.mjs so there is one probing implementation. Network-bound,
 // hence opt-in.
 async function checkPortalSlugs(root) {
-  const portalsPath = join(root, 'portals.yml');
+  const portalsPath = prereqFile(root, PORTALS_PREREQ);
   if (!existsSync(portalsPath)) {
     return { pass: true, label: 'Portal entries: no portals.yml yet (skipped)' };
   }
@@ -828,18 +896,22 @@ Paste job URLs below as \`- [ ] {url}\` then run \`/career-ops pipeline\`.
 `;
 
 function checkPipelineFile() {
-  const filePath = join(projectRoot, 'data', 'pipeline.md');
+  const filePath = process.env.CAREER_OPS_PIPELINE || join(projectRoot, 'data', 'pipeline.md');
+  const shown = process.env.CAREER_OPS_PIPELINE ? filePath : 'data/pipeline.md';
   if (existsSync(filePath)) {
-    return { pass: true, label: 'data/pipeline.md ready' };
+    return { pass: true, label: `${shown} ready` };
   }
   try {
+    mkdirSync(dirname(filePath), { recursive: true });
     writeFileSync(filePath, PIPELINE_SKELETON, 'utf-8');
-    return { pass: true, label: 'data/pipeline.md ready (auto-created)' };
+    return { pass: true, label: `${shown} ready (auto-created)` };
   } catch {
     return {
       pass: false,
-      label: 'data/pipeline.md could not be created',
-      fix: 'Run: mkdir -p data && touch data/pipeline.md',
+      label: `${shown} could not be created`,
+      fix: process.env.CAREER_OPS_PIPELINE
+        ? `Run: mkdir -p "$(dirname "$CAREER_OPS_PIPELINE")" && touch "$CAREER_OPS_PIPELINE"`
+        : 'Run: mkdir -p data && touch data/pipeline.md',
     };
   }
 }
@@ -935,7 +1007,7 @@ function checkCvShape(root) {
 }
 
 function checkProfileShape(root) {
-  const profilePath = process.env.CAREER_OPS_PROFILE || join(root, 'config', 'profile.yml');
+  const profilePath = profilePathFor(root);
   if (!existsSync(profilePath)) return null;   // the prereq check owns "absent"
   let findings;
   try {
@@ -982,6 +1054,8 @@ async function main() {
     checkAutoDir('output'),
     checkAutoDir('reports'),
     checkPlugins(projectRoot),
+    // checkPrereq already explains the .env case when the profile is missing.
+    prereqPresent(projectRoot, { path: 'config/profile.yml' }) ? checkEnvFileProfile(projectRoot) : null,
   ].filter(Boolean);
 
   // Network-bound portals.yml reachability probe — only under --strict.
@@ -1017,12 +1091,26 @@ async function main() {
   }
 
   console.log('');
+  const setupMissing = USER_LAYER_PREREQS.filter((prereq) => !prereqPresent(projectRoot, prereq));
+  const setupNote = setupMissing.length > 0
+    ? `Setup is not finished (${setupMissing.length} file${setupMissing.length === 1 ? '' : 's'} missing: ${setupMissing.map(({ path }) => path).join(', ')})`
+    : null;
+  const setupHint = `Open your AI CLI in this folder (${CLI_NAMES}) and it walks you through setup by chatting.`;
   if (failures > 0) {
     console.log(`Result: ${failures} issue${failures === 1 ? '' : 's'} found. Fix them and run \`npm run doctor\` again.`);
+    if (setupNote) {
+      console.log(`${setupNote}.`);
+      console.log(setupHint);
+    }
     process.exit(1);
   } else {
     const warnNote = warnings > 0 ? ` (${warnings} warning${warnings === 1 ? '' : 's'} — see above)` : '';
-    console.log(`Result: All checks passed${warnNote}. You're ready to go! Run \`claude\` (or \`opencode\`) to start.`);
+    if (setupNote) {
+      console.log(`Result: ${setupNote}${warnNote}.`);
+      console.log(setupHint);
+    } else {
+      console.log(`Result: All checks passed${warnNote}. You're ready to go! Open your AI CLI in this folder (${CLI_NAMES}) to start.`);
+    }
     console.log('');
     console.log('Join the community: https://discord.gg/8pRpHETxa4');
     console.log('Read the manifesto: `npm run manifesto` — a new way of job searching is taking shape, and you are now part of it.');
@@ -1066,8 +1154,12 @@ function unpersonalizedFiles(root) {
   const out = [];
   for (const { path, template, impact } of PERSONALIZATION_FILES) {
     const targetPath = join(root, ...path.split('/'));
-    const rootTemplatePath = join(root, ...template.split('/'));
-    const templatePath = existsSync(rootTemplatePath) ? rootTemplatePath : join(__dirname, ...template.split('/'));
+    // The checkout's template first, as the web reads it, so doctor and the web
+    // agree on which sections are still template text even when a separate data
+    // root holds an older copy. The data root's copy only covers a checkout
+    // that ships none (#5340).
+    const checkoutTemplatePath = join(__dirname, ...template.split('/'));
+    const templatePath = existsSync(checkoutTemplatePath) ? checkoutTemplatePath : join(root, ...template.split('/'));
     if (!existsSync(targetPath) || !existsSync(templatePath)) continue;
     let target, tpl;
     try {
@@ -1075,6 +1167,45 @@ function unpersonalizedFiles(root) {
       tpl = readFileSync(templatePath, 'utf-8');
     } catch {
       continue; // unreadable → let the existence checks speak
+    }
+    // An empty file is neither identical to the template nor carries a
+    // placeholder, so it would pass as personalized while the web asks for
+    // every section (#5340).
+    if (!target.trim()) {
+      out.push({ path, reason: 'is empty', impact });
+      continue;
+    }
+    if (path === 'modes/_profile.md') {
+      // A _profile.md written in the user's own structure, without any of the
+      // eight ## Your … headings, is quiet here rather than reported as missing
+      // every section (#5126). Missing prerequisites speak for absent files.
+      const userHeadings = new Set(scanHeadings(target).heads.filter((h) => h.level === 2).map((h) => h.heading));
+      const hasAnyTemplateHeading = SECTIONS.some((s) => userHeadings.has(s.heading));
+      if (!hasAnyTemplateHeading) {
+        const left = [...templatePlaceholders(tpl)].filter((p) => target.includes(p));
+        if (left.length > 0) {
+          out.push({
+            path,
+            reason: `still has ${left.length} unfilled placeholder${left.length === 1 ? '' : 's'} (e.g. ${left[0]})`,
+            impact,
+          });
+        }
+        continue;
+      }
+      const states = sectionState(target, tpl);
+      const unfilled = states.filter((s) => s.state !== 'filled');
+      if (unfilled.length > 0) {
+        const n = unfilled.length;
+        const templateCount = unfilled.filter((s) => s.state === 'template').length;
+        const missingCount = unfilled.filter((s) => s.state === 'missing').length;
+        const ids = unfilled.map((s) => s.id).join(', ');
+        out.push({
+          path,
+          reason: `still has ${n} unfilled section${n === 1 ? '' : 's'}: ${templateCount} on template, ${missingCount} missing (${ids})`,
+          impact,
+        });
+      }
+      continue;
     }
     if (target === tpl) {
       out.push({ path, reason: 'still identical to the shipped template', impact });
@@ -1093,6 +1224,8 @@ function unpersonalizedFiles(root) {
 }
 
 function checkPersonalization(root) {
+  const absent = PERSONALIZATION_FILES.filter(({ path }) => !existsSync(join(root, ...path.split('/'))));
+  if (absent.length === PERSONALIZATION_FILES.length) return null;
   const stale = unpersonalizedFiles(root);
   if (stale.length === 0) {
     return { label: 'Personalization files customized', pass: true };
@@ -1112,7 +1245,7 @@ function checkPersonalization(root) {
 function titleFilterConflicts(root) {
   // Same override the scanner honours (scan.mjs PORTALS_PATH), so a diagnosis
   // describes the file a scan would actually read, not the default one.
-  const portalsPath = process.env.CAREER_OPS_PORTALS || join(root, 'portals.yml');
+  const portalsPath = prereqFile(root, PORTALS_PREREQ);
   if (!existsSync(portalsPath)) return null;
   let config;
   try {
@@ -1169,7 +1302,7 @@ function onboardingState(root) {
     }
   }
   const missing = USER_LAYER_PREREQS
-    .filter(({ path }) => !prereqPresent(root, path))
+    .filter((prereq) => !prereqPresent(root, prereq))
     .map(({ path }) => path);
 
   const { cli: activeCli, source: cliSource, warning: cliWarning } = resolveActiveCli();
@@ -1187,12 +1320,14 @@ function onboardingState(root) {
   const bakCheck = checkTrackedBakFiles(codeRoot);
   const skillCheck = checkSkillEntrypoints(codeRoot);
   const cvShape = checkCvShape(root);
+  const envFileProfile = checkEnvFileProfile(root);
   const warnings = [
     ...(cliWarning ? [cliWarning] : []),
     ...(mcpCheck?.warn ? [`${mcpCheck.label}\n→ ${[].concat(mcpCheck.fix || []).join('\n  ')}`] : []),
     ...(bakCheck.warn ? [`${bakCheck.label}\n→ ${[].concat(bakCheck.fix || []).join('\n  ')}`] : []),
     ...(skillCheck.warn ? [`${skillCheck.label}\n→ ${[].concat(skillCheck.fix || []).join('\n  ')}`] : []),
     ...(cvShape?.warn ? [`${cvShape.label}\n→ ${[].concat(cvShape.fix || []).join('\n  ')}`] : []),
+    ...(envFileProfile ? [`${envFileProfile.label}\n→ ${envFileProfile.fix.join('\n  ')}`] : []),
     ...unpersonalized.map((u) => `${u.path} ${u.reason} — ${u.impact}\n→ Personalize it from cv.md before running evaluations.`),
   ];
 
