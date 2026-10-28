@@ -74,8 +74,6 @@ batch/tracker-additions/**/*.tsv
 # Worker scratch: prefetched JD text plus whatever compile cache the worker CLI
 # drops here. Fetched postings are user data — never stage them.
 batch/tmp/
-# Root scratch (screenshots, ad-hoc captures from agent sessions).
-/tmp/
 /jds
 !/jds/
 jds/*
@@ -206,7 +204,6 @@ follow-ups.md
 *.db
 *.db-wal
 *.db-shm
-.career-ops-data
 
 # OpenRouter runner — generated data (personal, never commit)
 data/model-blacklist.json
